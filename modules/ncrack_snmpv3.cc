@@ -1,8 +1,6 @@
-
 /***************************************************************************
- * modules.h -- header file containing declarations for every module's     *
- * main handler. To add more protocols to Ncrack, always write the         *
- * corresponding module's main function's declaration here.                *
+ * ncrack_snmpv3.cc -- ncrack module for SNMPv3 (user enumeration)
+ * Created by dsp
  *                                                                         *
  ***********************IMPORTANT NMAP LICENSE TERMS************************
  *                                                                         *
@@ -129,37 +127,203 @@
  *                                                                         *
  ***************************************************************************/
 
-#ifndef MODULES_H 
-#define MODULES_H 1
-
+#include "ncrack.h"
 #include "nsock.h"
+#include "Service.h"
+#include "modules.h"
 
-void ncrack_ftp(nsock_pool nsp, Connection *con);
-void ncrack_telnet(nsock_pool nsp, Connection *con);
-void ncrack_ssh(nsock_pool nsp, Connection *con);
-void ncrack_http(nsock_pool nsp, Connection *con);
-void ncrack_pop3(nsock_pool nsp, Connection *con);
-void ncrack_imap(nsock_pool nsp, Connection *con);
-void ncrack_smb(nsock_pool nsp, Connection *con);
-void ncrack_smb2(nsock_pool nsp, Connection *con);
-void ncrack_rdp(nsock_pool nsp, Connection *con);
-void ncrack_vnc(nsock_pool nsp, Connection *con);
-void ncrack_sip(nsock_pool nsp, Connection *con);
-void ncrack_redis(nsock_pool nsp, Connection *con);
-void ncrack_psql(nsock_pool nsp, Connection *con);
-void ncrack_mysql(nsock_pool nsp, Connection *con);
-void ncrack_winrm(nsock_pool nsp, Connection *con);
-void ncrack_owa(nsock_pool nsp, Connection *con);
-void ncrack_cassandra(nsock_pool nsp, Connection *con);
-void ncrack_mssql(nsock_pool nsp, Connection *con);
-void ncrack_mongodb(nsock_pool nsp, Connection *con);
-void ncrack_cvs(nsock_pool nsp, Connection *con);
-void ncrack_wordpress(nsock_pool nsp, Connection *con);
-void ncrack_joomla(nsock_pool nsp, Connection *con);
-void ncrack_dicom(nsock_pool nsp, Connection *con);
-void ncrack_mqtt(nsock_pool nsp, Connection *con);
-void ncrack_webform(nsock_pool nsp, Connection *con);
-void ncrack_couchbase(nsock_pool nsp, Connection *con);
-void ncrack_snmpv3(nsock_pool nsp, Connection *con);
+#define SNMP_TIMEOUT 20000
+#define SNMP_MAXMSG 1500
 
-#endif
+#define T_BOOLEAN	0x01
+#define T_INTEGER	0x02
+#define T_BIT_STRING	0x03
+#define T_OCTET_STRING	0x04
+#define T_DISPLAYSTRING	0x04
+#define T_NULL	0x05
+#define T_OBJECT_IDENTIFIER	0x06
+#define T_SEQUENCE	0x30
+#define T_IP_ADDRESS	0x40
+#define T_COUNTER32	0x41
+#define T_GAUGE32	0x42
+#define T_TIME_TICKS	0x43
+#define T_OPAQUE	0x44
+#define T_NSAP_ADDRESS	0x45
+#define T_COUNTER64	0x46
+#define T_UINTEGER32	0x47
+
+#define START_MSGID 0xb33f
+
+extern void ncrack_read_handler(nsock_pool nsp, nsock_event nse, void *mydata);
+extern void ncrack_write_handler(nsock_pool nsp, nsock_event nse, void *mydata);
+extern void ncrack_module_end(nsock_pool nsp, void *mydata);
+
+static int snmpv3_loop_read(nsock_pool nsp, Connection *con);
+
+/* In SNMPV3_INIT we send a get-request message.
+ * In SNMPV3_INIT_REPLY we receive a response that reveals the msgAuthoritativeEngineID
+ * In SNMPV3_USERNAME we send a message using the above id and a test username
+ * In SNMPV3_USERNAME_REPLY we receive a response indicating if the username exists.
+ */
+enum states { SNMPV3_INIT, SNMPV3_INIT_REPLY, SNMPV3_USERNAME, SNMPV3_USERNAME_REPLY };
+
+typedef struct type_len {
+	uint8_t t;
+	uint8_t l;
+} __attribute__((__packed__)) type_len;
+
+typedef struct snmp_msg_header {
+	type_len tl;
+	struct snmp_version {
+		type_len tl;
+		uint8_t v;
+		snmp_version() {
+			tl.t = T_INTEGER;
+			tl.l = 0x1; /* only one byte integer for version */
+			v = 0x3; /* snmp v3 */
+		}
+	} __attribute__((__packed__)) m_vers;
+
+	struct snmp_globaldata {
+		type_len tl;
+		struct msg_id {
+			type_len tl;
+			uint32_t id;
+
+			msg_id() {
+				tl.t = T_SEQUENCE;
+				tl.l = 0x4;
+				id = START_MSGID;
+			}
+		} __attribute__((__packed__)) m_id;
+
+		struct msg_max_sz {
+			type_len tl;
+			uint8_t sz[3];
+
+			msg_max_sz() {
+				u_char staticsz[3] = {0x00, 0xff, 0xe3}; /* 65507 */
+				tl.t = T_INTEGER;
+				tl.l = 0x3;
+				memcpy(sz, staticsz, 3);
+			}
+		} __attribute__((__packed__)) m_maxsz;
+
+		struct msg_flags {
+			type_len tl;
+			u_char flag;
+
+			msg_flags() {
+				tl.t = T_OCTET_STRING;
+				tl.l = 0x1;
+				flag = 0x4; /* 100, Reportable set, Encrypted not set, Authenticatable not set */
+			}
+		} __attribute__((__packed__)) m_flags;
+
+		struct msg_security_model {
+			type_len tl;
+			u_char model;
+
+			msg_security_model() {
+				tl.t = T_INTEGER;
+				tl.l = 0x1;
+				model = 0x3; /* USM */
+			}
+		} __attribute__((__packed__)) m_secmod;
+	} __attribute__((__packed__)) m_globaldata;
+
+	snmp_msg_header(uint8_t sz) {
+		tl.t = T_SEQUENCE;
+		tl.l = sz; /* need to be set before transmission */
+	}
+} __attribute__((__packed__)) snmp_msg_header;
+
+typedef struct snmp_get_data() {
+	snmp_header h;
+	u_char data[40];
+
+	snmp_get_data(uint32 seq) {
+		h = snmp_msg_header(62);
+		u_char staticmsg[40] = "\x30\x3e\x02\x01\x03\x30\x11\x02\x04\x40\xa3\x72\x4e\x02\x03\x00" \
+"\xff\xe3\x04\x01\x04\x02\x01\x03\x04\x10\x30\x0e\x04\x00\x02\x01" \
+"\x00\x02\x01\x00\x04\x00\x04\x00\x04\x00\x30\x14\x04\x00\x04\x00" \
+"\xa0\x0e\x02\x04\x33\x7b\x1b\x53\x02\x01\x00\x02\x01\x00\x30\x00";
+		memcpy(data, staticmsg, 40);
+		memcpy(data+28, htonl(seq), 4);
+	}
+} __attribute__((__packed__)) snmp_get_data;
+
+
+static int
+snmpv3_loop_read(nsock_pool nsp, Connection *con)
+{
+	snmp_msg_header *p;
+	typelen *tl;
+
+	/* if there are less than 4 bytes we can't figure out a 
+	 * type length. so we try to read again
+	 */
+	if (con->inbuf == NULL || con->inbuf->get_len() < 4) {
+		nsock_read(nsp, con->niod, ncrack_read_handler, SNMP_TIMEOUT, con);
+		return -1;
+	}
+
+	tl = (typelen *) ((char *)con->inbuf->get_dataptr());
+
+	/* read up to len bytes*/
+	if (con->inbuf->get_len() < tl->l) {
+		nsock_read(nsp, con->niod, ncrack_read_handler, SNMP_TIMEOUT, con);
+		return -1;
+	}
+
+	p = (struct snmp_msg_header *)((char *)con->inbuf->get_dataptr());
+	if (p->m_vers.v != 0x3) /* not an snmp v3 message */
+		return -2;
+
+	/* XXX more sanity check */
+	return 0;
+}
+
+void
+ncrack_snmpv3(nsock_pool nsp, Connection *con)
+{
+	nsock_iod = con->niod;
+	Service *serv = con->service;
+	snmp_msg_header *reply;
+	uint32_t rid; // reply id
+
+	switch (con->state) {
+		case SNMPV3_INIT:
+			con->state = SNMPV3_INIT_REPLY;
+			delete con->inbuf;
+			con->inbuf = NULL;
+
+			if (con->outbuf)
+				delete con->outbuf;
+			con->outbuf = new Buf();
+
+			snmp_get_data gd = snmp_get_data(8888);
+			con->outbuf->append(&gd, sizeof(snmp_get_data));
+
+			nsock_write(nsp, nsi, ncrack_write_handler, SNMP_TIMEOUT, con,
+					(const char *)con->outbuf->get_dataptr(), con->outbuf->get_len());
+			break;
+		case SNMPV3_INIT_REPLY:
+			if (snmpv3_loop_read(nsp, con) < 0)
+				break;
+			reply = (snmp_msg_header *)con->inbuf->get_dataptr();
+			// check that this is a reply to the previous message id.
+			rid = reply->m_globaldata->m_id->id;
+			if (rid != 8888) {
+				printf("wrong message id in reply:%ud \n", rid);
+				break;
+			}
+			// extract the engine id.
+
+			
+		default:
+			printf("done!\n");
+			return 
+
+	}
+}

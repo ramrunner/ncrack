@@ -828,6 +828,8 @@ call_module(nsock_pool nsp, Connection *con)
     ncrack_smb(nsp, con);
   else if (!strcmp(name, "smb2"))
     ncrack_smb2(nsp, con);
+  else if (!strcmp(name, "snmpv3"))
+    ncrack_snmpv3(nsp, con);
 
 #endif
   else
