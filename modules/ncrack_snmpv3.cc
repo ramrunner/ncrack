@@ -152,11 +152,14 @@
 #define T_COUNTER64	0x46
 #define T_UINTEGER32	0x47
 
-#define START_MSGID 0xb33f
+#define MSGID_MAX 832 
+#define MSGID_MIN 432
+
 
 extern void ncrack_read_handler(nsock_pool nsp, nsock_event nse, void *mydata);
 extern void ncrack_write_handler(nsock_pool nsp, nsock_event nse, void *mydata);
 extern void ncrack_module_end(nsock_pool nsp, void *mydata);
+static void snmpv3_free(Connection *con);
 
 static int snmpv3_loop_read(nsock_pool nsp, Connection *con);
 
@@ -172,93 +175,83 @@ typedef struct type_len {
 	uint8_t l;
 } __attribute__((__packed__)) type_len;
 
-typedef struct snmp_msg_header {
+typedef struct snmp_version {
 	type_len tl;
-	struct snmp_version {
+	uint8_t v;
+} __attribute__((__packed__)) m_vers;
+
+typedef struct snmp_globaldata {
+	type_len tl;
+	struct msg_id {
 		type_len tl;
-		uint8_t v;
-		snmp_version() {
-			tl.t = T_INTEGER;
-			tl.l = 0x1; /* only one byte integer for version */
-			v = 0x3; /* snmp v3 */
-		}
-	} __attribute__((__packed__)) m_vers;
+		uint32_t id;
+	} __attribute__((__packed__)) m_id;
+} __attribute__((__packed__)) m_globaldata;
 
-	struct snmp_globaldata {
-		type_len tl;
-		struct msg_id {
-			type_len tl;
-			uint32_t id;
+/*
+ * attempting to map snmpv3 message format from 
+ * https://www.rfc-editor.org/rfc/rfc3412#page-19
+ */
+typedef struct snmp_v3_msg {
+	type_len tl;
+	m_vers v;
+	m_globaldata g;
+	/* security parameter bytes */
+	/* PDU bytes */
+} __attribute__((__packed__)) m_v3;
 
-			msg_id() {
-				tl.t = T_SEQUENCE;
-				tl.l = 0x4;
-				id = START_MSGID;
-			}
-		} __attribute__((__packed__)) m_id;
 
-		struct msg_max_sz {
-			type_len tl;
-			uint8_t sz[3];
+typedef struct snmp_get_data {
+	u_char data[64];
 
-			msg_max_sz() {
-				u_char staticsz[3] = {0x00, 0xff, 0xe3}; /* 65507 */
-				tl.t = T_INTEGER;
-				tl.l = 0x3;
-				memcpy(sz, staticsz, 3);
-			}
-		} __attribute__((__packed__)) m_maxsz;
-
-		struct msg_flags {
-			type_len tl;
-			u_char flag;
-
-			msg_flags() {
-				tl.t = T_OCTET_STRING;
-				tl.l = 0x1;
-				flag = 0x4; /* 100, Reportable set, Encrypted not set, Authenticatable not set */
-			}
-		} __attribute__((__packed__)) m_flags;
-
-		struct msg_security_model {
-			type_len tl;
-			u_char model;
-
-			msg_security_model() {
-				tl.t = T_INTEGER;
-				tl.l = 0x1;
-				model = 0x3; /* USM */
-			}
-		} __attribute__((__packed__)) m_secmod;
-	} __attribute__((__packed__)) m_globaldata;
-
-	snmp_msg_header(uint8_t sz) {
-		tl.t = T_SEQUENCE;
-		tl.l = sz; /* need to be set before transmission */
-	}
-} __attribute__((__packed__)) snmp_msg_header;
-
-typedef struct snmp_get_data() {
-	snmp_header h;
-	u_char data[40];
-
-	snmp_get_data(uint32 seq) {
-		h = snmp_msg_header(62);
-		u_char staticmsg[40] = "\x30\x3e\x02\x01\x03\x30\x11\x02\x04\x40\xa3\x72\x4e\x02\x03\x00" \
+	snmp_get_data(uint32_t seq) {
+		uint32_t seqbytes = htonl(seq);
+		u_char staticmsg[65] = "\x30\x3e\x02\x01\x03\x30\x11\x02\x04\x40\xa3\x72\x4e\x02\x03\x00" \
 "\xff\xe3\x04\x01\x04\x02\x01\x03\x04\x10\x30\x0e\x04\x00\x02\x01" \
 "\x00\x02\x01\x00\x04\x00\x04\x00\x04\x00\x30\x14\x04\x00\x04\x00" \
 "\xa0\x0e\x02\x04\x33\x7b\x1b\x53\x02\x01\x00\x02\x01\x00\x30\x00";
-		memcpy(data, staticmsg, 40);
-		memcpy(data+28, htonl(seq), 4);
+		memcpy(data, staticmsg, 64);
+		memcpy(data+28, &seqbytes, 4);
 	}
-} __attribute__((__packed__)) snmp_get_data;
+} snmp_get_data;
+
+typedef struct snmp_username_msg {
+	u_char data[1024];
+	uint8_t len = 0;
+	snmp_username_msg(uint32_t msgid) {
+		uint32_t id = htonl(msgid);
+		// since this message is > 127 bytes the ASN.1 encodes the len
+		// in 2 bytes. the first being 0x81 and the second the actual length (138).
+		u_char staticmsg[139] = "\x30\x81\x87\x02\x01\x03\x30\x11\x02\x04\x40\xa3\x72\x4d\x02\x03" \
+"\x00\xff\xe3\x04\x01\x07\x02\x01\x03\x04\x3b\x30\x39\x04\x11\x80" \
+"\x00\x1f\x88\x80\x75\x7e\x6d\x15\xe8\x39\x39\x63\x00\x00\x00\x00" \
+"\x02\x01\x06\x02\x02\x01\x98\x04\x05\x77\x72\x6f\x6e\x67\x04\x0c" \
+"\x9b\x31\xb5\xe0\x0c\xae\x22\x26\xc8\xa1\x9d\xa7\x04\x08\x5e\xb2" \
+"\x82\xcb\x7c\xe1\x64\x5e\x04\x32\x87\xa2\x55\x98\x2e\xd6\xc8\x9a" \
+"\xab\xa2\x4b\xab\x91\x65\x03\xdd\xc1\x4b\xff\xab\x07\x40\xfa\xdb" \
+"\xa4\x40\x49\x0f\xca\xeb\x99\x46\x34\x3f\x75\xe9\x24\x97\x57\xdf" \
+"\x18\xea\x34\x54\x55\x84\x39\xf7\xe6\x86";
+		memcpy(data, staticmsg, 10); /* up to the message id */
+		len += 10;
+		memcpy(data+10, &id, 4);
+		len += 4;
+		memcpy(data+14, staticmsg+14, 15); /* up to the security parameters */
+		len += 15;
+		/* the static message is produced by the username "wrong" len 5. so for a null
+		 * username the type_lengths at the beginning of the security parameter should
+		 * be both reduced by 5
+		 */
+		memcpy(data+29, staticmsg+29, 138-29); /* XXX: just copy the rest for now */
+		len += 138-29;
+	}
+} snmp_username_msg;
 
 
 static int
 snmpv3_loop_read(nsock_pool nsp, Connection *con)
 {
-	snmp_msg_header *p;
-	typelen *tl;
+	m_v3 *p;
+	type_len *tl;
 
 	/* if there are less than 4 bytes we can't figure out a 
 	 * type length. so we try to read again
@@ -268,7 +261,7 @@ snmpv3_loop_read(nsock_pool nsp, Connection *con)
 		return -1;
 	}
 
-	tl = (typelen *) ((char *)con->inbuf->get_dataptr());
+	tl = (type_len *) ((char *)con->inbuf->get_dataptr());
 
 	/* read up to len bytes*/
 	if (con->inbuf->get_len() < tl->l) {
@@ -276,25 +269,48 @@ snmpv3_loop_read(nsock_pool nsp, Connection *con)
 		return -1;
 	}
 
-	p = (struct snmp_msg_header *)((char *)con->inbuf->get_dataptr());
-	if (p->m_vers.v != 0x3) /* not an snmp v3 message */
+	p = (m_v3 *)((char *)con->inbuf->get_dataptr());
+	if (p->v.v != 0x3) /* not an snmp v3 message */
 		return -2;
 
-	/* XXX more sanity check */
 	return 0;
 }
 
+typedef struct crack_state {
+	u_char eng_id[17]; /* RFC specifies it to 17 bytes */
+	uint32_t cur_msg_id; /* stored as int, need to htonl before serializing */
+	bool eng_id_set;
+} crack_state;
+
+// we need to allocate a buffer that will hold the security parameters
+// for subsequent requests. This will be set by the first init_reply message
+// this module provides a free function that will be called upon the modules
+// exit (see Connection.h->ops_free)
 void
 ncrack_snmpv3(nsock_pool nsp, Connection *con)
 {
-	nsock_iod = con->niod;
+	
+	con->ops_free = &snmpv3_free;
+	crack_state *cs = (crack_state *)con->misc_info;
+	if (cs == NULL) { /* we need to allocate a sec_params struct */
+		con->misc_info = (crack_state *) safe_zalloc(sizeof(crack_state));
+		cs->eng_id_set = false;
+		cs->cur_msg_id = (uint32_t)(rand() + MSGID_MIN);
+	}
+	nsock_iod nsi = con->niod;
 	Service *serv = con->service;
-	snmp_msg_header *reply;
-	uint32_t rid; // reply id
+	m_v3 *reply;
+	uint32_t mid; // message id should be the same on the reply packet
+	snmp_get_data gd = snmp_get_data(cs->cur_msg_id);
+	type_len *sec_p;
+	/* the maximum offset we can address according to the message type_len*/
+	uint32_t max_offset = 0; 
+	snmp_username_msg umsg = snmp_username_msg(cs->cur_msg_id);
 
 	switch (con->state) {
 		case SNMPV3_INIT:
 			con->state = SNMPV3_INIT_REPLY;
+			printf("at 1\n");
 			delete con->inbuf;
 			con->inbuf = NULL;
 
@@ -302,28 +318,92 @@ ncrack_snmpv3(nsock_pool nsp, Connection *con)
 				delete con->outbuf;
 			con->outbuf = new Buf();
 
-			snmp_get_data gd = snmp_get_data(8888);
-			con->outbuf->append(&gd, sizeof(snmp_get_data));
+			con->outbuf->append(gd.data, sizeof(gd.data));
 
 			nsock_write(nsp, nsi, ncrack_write_handler, SNMP_TIMEOUT, con,
 					(const char *)con->outbuf->get_dataptr(), con->outbuf->get_len());
 			break;
 		case SNMPV3_INIT_REPLY:
+			printf("at 2\n");
 			if (snmpv3_loop_read(nsp, con) < 0)
 				break;
-			reply = (snmp_msg_header *)con->inbuf->get_dataptr();
+			reply = (m_v3 *)con->inbuf->get_dataptr();
+			max_offset = reply->tl.l - 2;
 			// check that this is a reply to the previous message id.
-			rid = reply->m_globaldata->m_id->id;
-			if (rid != 8888) {
-				printf("wrong message id in reply:%ud \n", rid);
+			mid = reply->g.m_id.id;
+			if (mid != cs->cur_msg_id) {
+				printf("wrong message id in reply:%ud\n", mid);
 				break;
 			}
-			// extract the engine id.
-
+			con->state = SNMPV3_USERNAME;
 			
+			if (!cs->eng_id_set) { /* we need to populate  the engine id */
+				/* extract the security parameters that contain the engine id . 
+				 * this is a OCTET_STRING sequence after the globaldata. from the start it is:
+				 * [tl][m_vers][m_globaldata][security_parameters]
+				 * so this starts at  reply->g.l + 7 (7 -> 2 tl packet + 2 tl version + 1 version + 2 tl globaldata)
+				 */
+				sec_p = (type_len *)(((unsigned char *)con->inbuf->get_dataptr()) + (reply->g.tl.l + 7));
+				if (sec_p->t != T_OCTET_STRING || sec_p->l > max_offset - 5 - reply->g.tl.l) {
+					printf("length in security parameters type_len is beyond message offset\n");
+					break;
+				} 
+				memcpy(cs->eng_id, sec_p+6, 17); /* engine id is always 17 bytes */
+				cs->eng_id_set = true;
+			}
+			/* we need to increase the msg id */
+			if (cs->cur_msg_id >= MSGID_MAX)
+				cs->cur_msg_id = MSGID_MIN-1;
+			cs->cur_msg_id += 1;
+
+
+			break;
+
+		case SNMPV3_USERNAME:
+			printf("at 3\n");
+			con->state = SNMPV3_USERNAME_REPLY;
+			delete con->inbuf;
+			con->inbuf = NULL;
+
+			if (con->outbuf)
+				delete con->outbuf;
+			con->outbuf = new Buf();
+			con->outbuf->append(umsg.data, umsg.len);
+
+			nsock_write(nsp, nsi, ncrack_write_handler, SNMP_TIMEOUT, con,
+					(const char *)con->outbuf->get_dataptr(), con->outbuf->get_len());
+			break;
+
+		case SNMPV3_USERNAME_REPLY:
+			printf("at 4\n");
+			if (snmpv3_loop_read(nsp, con) < 0)
+				break;
+			reply = (m_v3 *)con->inbuf->get_dataptr();
+			max_offset = reply->tl.l - 2;
+			// check that this is a reply to the previous message id.
+			mid = reply->g.m_id.id;
+			if (mid != cs->cur_msg_id) {
+				printf("wrong message id in reply:%ud\n", mid);
+				break;
+			}
+			printf("well i got a reply yo");
+			con->state = SNMPV3_INIT;
+			delete con->inbuf;
+			con->inbuf = NULL;
+			return ncrack_module_end(nsp, con);
+
 		default:
 			printf("done!\n");
-			return 
-
+			return;
 	}
+}
+
+static void
+snmpv3_free(Connection *con)
+{
+	crack_state *p = NULL;
+	if (con->misc_info == NULL)
+		return;
+	p = (crack_state *)con->misc_info;
+	free(p);
 }
